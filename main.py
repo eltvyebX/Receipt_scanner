@@ -1,301 +1,411 @@
+# main.py
 import os
 import re
-import shutil
 import sqlite3
-import tempfile 
-from typing import Optional
+import traceback
+import base64
 from datetime import datetime
+from typing import Optional
 
-from fastapi import FastAPI, Request, File, UploadFile, Form
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Request, Form, UploadFile, File
+from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageFilter 
+
+from PIL import Image, ImageFilter, ImageOps
 import pytesseract
 
+# ---------- إعداد التطبيق و المسارات ----------
 app = FastAPI()
-
-if not os.path.exists("templates"):
-    os.makedirs("templates")
-
-templates = Jinja2Templates(directory="templates")
-
 DB_NAME = "bank_receipts.db"
 
+# سنخزن الصور داخل static/receipts حتى تكون سهلة العرض عبر القالب
+RECEIPTS_DIR = os.path.join("static", "receipts")
+os.makedirs(RECEIPTS_DIR, exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+os.makedirs("static", exist_ok=True)
+
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ---------- تهيئة قاعدة البيانات ----------
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        c = conn.cursor()
+        # جدول المستخدمين
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT UNIQUE,
+                bank_account TEXT UNIQUE,
+                pin TEXT
+            )
+        """)
+        # جدول المعاملات/الإيصالات
+        c.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER INTEGER PRIMARY KEY AUTOINCREMENT,
-                trx_last4 TEXT,
-                trx_date TEXT,
-                amount REAL
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                image_path TEXT,
+                amount REAL DEFAULT 0,
+                created_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
             )
         """)
         conn.commit()
 
 init_db()
 
-# --- دالة جديدة لحساب الإجمالي ---
-def calculate_total_amount():
-    """يحسب مجموع حقل المبلغ (amount) في جميع سجلات المعاملات."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        # استخدام دالة SUM المدمجة في SQLite
-        cursor.execute("SELECT SUM(amount) FROM transactions")
-        total = cursor.fetchone()[0]
-        # إذا كان الجدول فارغاً، فإن SUM قد يعيد None، لذا نضمن إعادة 0.0
-        return total if total is not None else 0.0
 
-def extract_data_from_image(image_path):
+# ---------- دوال مساعدة ----------
+def calculate_total_amount_for_user(user_id: int) -> float:
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT SUM(amount) FROM transactions WHERE user_id = ?", (user_id,))
+        total = c.fetchone()[0]
+        return float(total) if total is not None else 0.0
+
+
+def preprocess_for_ocr(pil_img: Image.Image) -> Image.Image:
     """
-    دالة استخراج البيانات مع تحسين معالجة الصور ودعم الكلمات المفتاحية العربية.
+    تحسين بسيط للصورة لجعل OCR أكثر دقة على خلفية بيضاء:
+    - تحويل للـ grayscale
+    - تعزيز التباين (autocontrast)
+    - مرشحات للتوضيح
+    - تطبيق threshold (عتبة) بسيطة
     """
-    data = {"trx_last4": "", "date_time": "", "amount": 0.0}
-    clean_text = ""
-    tmp_filename = None
-    
     try:
-        # 1. Image Preprocessing
-        img = Image.open(image_path)
-        img = img.convert('L')
+        img = pil_img.convert("L")  # to grayscale
+        img = ImageOps.autocontrast(img, cutoff=1)  # remove extreme pixels
         img = img.filter(ImageFilter.SHARPEN)
-        width, height = img.size
-        img = img.resize((int(width * 1.5), int(height * 1.5)), Image.LANCZOS)
-        
-        # 2. استخراج النص الخام باستخدام ملف مؤقت 
-        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_file:
-            tmp_filename = tmp_file.name
-            img.save(tmp_filename, format='TIFF')
+        # تطبيق عتبة بسيطة: يجعل الخلفية بيضاء والنص أسود
+        # قيمة العتبة 200 تعمل غالبًا جيدة مع خلفية بيضاء واضحة
+        threshold = 200
+        fn = lambda x: 255 if x > threshold else 0
+        img = img.point(fn, "L")
+        # إعادة تحسين بسيط
+        img = ImageOps.autocontrast(img, cutoff=0)
+        return img
+    except Exception:
+        return pil_img
 
-        text = pytesseract.image_to_string(tmp_filename)
-        
-        # تنظيف النص: استبدال الفواصل الغريبة والشرطات الطويلة
-        clean_text = text.replace('|', '/').replace('\\', '/').replace('—', '-').replace('–', '-')
-        
-        # طباعة النص الخام للمساعدة في التشخيص
-        print("--- RAW TEXT START ---")
-        print(clean_text)
-        print("--- RAW TEXT END ---")
-        
-        # --- 1. استخراج المبلغ (Amount) ---
-        
-        amount_keywords = r'(?:المبلغ|المبلع|الإجمالي|إجمالي|رصيد|Amount|Total|SAR|AED|USD|Balance|Value)'
-        
-        # النمط يركز على الكلمة المفتاحية ثم يلتقط الرقم (مع فواصل اختيارية)
-        amount_regex = fr'{amount_keywords}[\s:\.]*(\d{{1,3}}(?:[,\s]?[0-9]{{3}})*[\.,]?[0-9]{{0,3}})'
-        amount_match = re.search(amount_regex, clean_text, re.IGNORECASE)
-        
-        raw_amount = None
-        if amount_match:
-            raw_amount = amount_match.group(1)
-        
-        # محاولات احتياطية (تم الاحتفاظ بها لضمان التوافق)
-        if not raw_amount:
-            generic_amount_match = re.search(r'\b(\d{1,6}(?:[,\s]\d{3})*[\.,]\d{2})\b', clean_text)
-            if generic_amount_match:
-                raw_amount = generic_amount_match.group(1)
-        
-        if not raw_amount:
-            generic_amount_match = re.search(r'\b(\d{2,})\b', clean_text)
-            if generic_amount_match:
-                 raw_amount = generic_amount_match.group(1)
 
-        if raw_amount:
-            # تنظيف: إزالة فواصل الآلاف أولاً (مسافة أو فاصلة)
-            clean_amount = raw_amount.replace(' ', '')
-            
-            # إذا كانت الفاصلة هي الفاصل العشري، نوحدها إلى نقطة
-            if ',' in clean_amount and '.' not in clean_amount:
-                # إذا كانت آخر فاصلة تسبق رقمين، نعتبرها فاصل عشري
-                if re.search(r',(\d{2})$', clean_amount):
-                    # إزالة أي نقاط قد تكون فواصل آلاف ثم استبدال الفاصلة بالنقطة
-                    clean_amount = clean_amount.replace('.', '').replace(',', '.') 
-                else:
-                    # إذا كانت فواصل آلاف فقط، يتم إزالتها
-                    clean_amount = clean_amount.replace(',', '') 
-            
-            # إذا كان الرقم لا يحتوي على فاصل عشري بعد التنظيف، فإنه يعتبر رقم صحيح، لذا يجب إزالة أي نقاط متبقية (فواصل آلاف محتملة)
-            if '.' not in clean_amount and clean_amount.count('.') > 0:
-                clean_amount = clean_amount.replace('.', '')
-            
+def extract_amount_from_text(text: str) -> float:
+    """
+    بحث مرن عن الرقم المقابل لكلمة 'المبلغ' أو 'Amount' داخل النص.
+    يعيد 0.0 إذا لم يعثر على قيمة صالحة.
+    """
+    if not text:
+        return 0.0
+
+    # تنظيف النص
+    txt = text.replace('\n', ' ').replace('\r', ' ')
+    # أولاً: البحث عن كلمة المبلغ باللغة العربية أو الإنجليزية ثم رقم
+    patterns = [
+        r'(?:المبلغ|المبلع|الإجمالي|إجمالي|رصيد)\s*[:\-]?\s*([\d{1,3}][\d\.,\s]{0,20}\d)',  # عربي
+        r'(?:Amount|Total|Balance|Value)\s*[:\-]?\s*([\d{1,3}][\d\.,\s]{0,20}\d)',        # إنجليزي
+        r'([\d{1,3}](?:[,\s]\d{3})*(?:[.,]\d{1,3})?)'                                   # رقم عام
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE)
+        if m:
+            raw = m.group(1)
+            # تنظيف الرمز
+            cleaned = raw.replace(' ', '').replace(',', '.')
+            # إزالة أي حروف غير رقمية أو نقاط
+            cleaned = re.sub(r'[^\d\.]', '', cleaned)
+            # التأكد من وجود رقم صالح
             try:
-                # التحويل إلى رقم عشري. إذا كان 1300، فسيتم تحويله إلى 1300.0
-                data["amount"] = float(clean_amount)
-            except ValueError:
-                print(f"Failed to convert amount to float: {clean_amount}")
-                pass
+                return float(cleaned)
+            except Exception:
+                continue
 
-        # --- 2. استخراج رقم العملية (Transaction ID) ---
-        # (بقية المنطق بدون تغيير)
-        trx_keywords_ar = r'(?:رقم\s*العملية)'
-        trx_match_ar = re.search(fr'{trx_keywords_ar}[\W_]*([0-9]+)', clean_text, re.IGNORECASE)
-        
-        trx_keywords_all = r'(?:Trx\.|ID|Ref|No|Operation|Sequence|Number|رقم|عملية)'
-        trx_match_all = re.search(fr'{trx_keywords_all}[\W_]*([0-9]+)', clean_text, re.IGNORECASE)
-        
-        full_id = None
-        
-        if trx_match_ar:
-            full_id = trx_match_ar.group(1)
-        elif trx_match_all:
-            full_id = trx_match_all.group(1)
-        else:
-            long_number_match = re.search(r'(\d{8,})', clean_text)
-            if long_number_match:
-                full_id = long_number_match.group(1)
+    return 0.0
 
-        if full_id:
-            data["trx_last4"] = full_id[-4:]
-        
-        # --- 3. استخراج التاريخ والوقت (بدون تغيير) ---
-        
-        months = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
-        
-        # أ) البحث عن النمط المدمج (تاريخ + وقت)
-        combined_pattern = fr'\b(\d{{1,2}}[\s\-\/]+{months}[\s\-\/]+\d{{4}}[\sT,]*\d{{1,2}}:\d{{2}}(?::\d{{2}})?)\b'
-        combined_match = re.search(combined_pattern, clean_text, re.IGNORECASE)
-        
-        if combined_match:
-            data["date_time"] = combined_match.group(1).strip()
-        else:
-            # ب) البحث المنفصل (إذا فشل البحث المدمج)
-            found_date = ""
-            found_time = ""
 
-            # البحث عن الوقت
-            time_pattern = r'\b([0-1]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?(\s?(?:AM|PM|am|pm))?\b'
-            time_matches = re.findall(time_pattern, clean_text)
-            
-            # إضافة الكلمة المفتاحية العربية: الوقت
-            time_keyword = r'(?:Time|الوقت)'
-            time_keyword_match = re.search(fr'{time_keyword}[\s:.]*({time_pattern})', clean_text, re.IGNORECASE)
-            
-            if time_keyword_match:
-                found_time = time_keyword_match.group(0).replace("Time", "").replace("الوقت", "").strip(": .")
-            elif time_matches:
-                t = time_matches[0]
-                found_time = f"{t[0]}:{t[1]}" 
-                if t[2]: found_time += f":{t[2]}"
-                if t[3]: found_time += f"{t[3]}"
-
-            # البحث عن التاريخ
-            # إضافة الكلمة المفتاحية العربية: التاريخ
-            date_keyword = r'(?:Date|التاريخ)'
-            date_keyword_match = re.search(fr'{date_keyword}[\s:.]*([0-9A-Za-z\/\-\.\, ]+)', clean_text, re.IGNORECASE)
-            numeric_date = re.search(r'\b(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})\b', clean_text)
-            textual_date = re.search(fr'\b(\d{{1,2}}[\s\-\/]+{months}[\s\-\/]+\d{{2,4}}|{months}[\s\-\/]+\d{{1,2}}(?:th|st|nd|rd)?[\s,]+\d{{2,4}})\b', clean_text, re.IGNORECASE)
-
-            if date_keyword_match and len(date_keyword_match.group(1)) < 20:
-                found_date = date_keyword_match.group(1).strip()
-            elif textual_date:
-                found_date = textual_date.group(0)
-            elif numeric_date:
-                found_date = numeric_date.group(0)
-
-            data["date_time"] = f"{found_date} {found_time}".strip()
-        
-        # --- 4. تنسيق التاريخ ---
-        raw_date_time = data["date_time"]
-
-        if raw_date_time:
-            # قائمة بالتنسيقات المحتملة للتواريخ المستخرجة
-            input_formats = [
-                '%d-%b-%Y %H:%M:%S',  
-                '%d-%b-%Y%H:%M:%S',   
-                '%d-%b-%Y',           
-                '%d/%m/%Y',           
-                '%Y-%m-%d %H:%M:%S', 
-                '%d/%m/%Y %H:%M:%S'
-            ]
-            output_format = '%H:%M:%S %d-%m-%Y' # التنسيق المطلوب: DD-MM-YYYY
-
-            for fmt in input_formats:
-                try:
-                    # محاولة تحليل السلسلة النصية إلى كائن تاريخ
-                    dt_object = datetime.strptime(raw_date_time, fmt)
-                    
-                    # إذا نجح التحليل، قم بالتنسيق إلى DD-MM-YYYY وقم بتعيين القيمة
-                    data["date_time"] = dt_object.strftime(output_format)
-                    break 
-                except ValueError:
-                    # إذا لم يتطابق التنسيق، حاول التنسيق التالي
-                    continue
-            
-        # --- 5. نهاية الدالة ---
-
-        return data, clean_text
-    except Exception as e:
-        print(f"Error inside OCR: {e}")
-        return {"trx_last4": "", "date_time": "", "amount": 0.0}, ""
-    finally:
-        # 3. التأكد من حذف الملف المؤقت في جميع الأحوال
-        if tmp_filename and os.path.exists(tmp_filename):
-            os.remove(tmp_filename)
-
-# --- Routes ---
-
+# ---------- صفحات المستخدم (Start / Register / Show PIN / Login) ----------
 @app.get("/")
-def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+def start_page(request: Request):
+    return templates.TemplateResponse("start_page.html", {"request": request})
 
+
+@app.get("/register")
+def register_page(request: Request):
+    return templates.TemplateResponse("register.html", {"request": request, "user_id": ""})
+
+
+@app.post("/register")
+def register_user(request: Request, bank_account: str = Form(...)):
+    import random, string
+    user_id = "USR-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    pin = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO users (user_id, bank_account, pin) VALUES (?, ?, ?)",
+                      (user_id, bank_account, pin))
+            conn.commit()
+    except sqlite3.IntegrityError:
+        # حساب/مستخدم مكرر
+        return templates.TemplateResponse("register.html", {
+            "request": request,
+            "error": "رقم الحساب مستخدم مسبقًا. استخدم حسابًا آخر أو تواصل معي.",
+            "user_id": ""
+        })
+    except Exception:
+        traceback.print_exc()
+        return templates.TemplateResponse("register.html", {
+            "request": request,
+            "error": "حدث خطأ أثناء التسجيل. حاول لاحقًا.",
+            "user_id": ""
+        })
+
+    # عرض صفحة الـ PIN (تُعرض مرة واحدة)
+    return templates.TemplateResponse("show_pin.html", {"request": request, "user_id": user_id, "pin": pin})
+
+
+@app.get("/login")
+def login_page(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request})
+
+
+@app.post("/login")
+def login_user(request: Request, bank_account: str = Form(...), pin: str = Form(...)):
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT id FROM users WHERE bank_account = ? AND pin = ?", (bank_account, pin))
+            row = c.fetchone()
+            if row:
+                user_db_id = str(row["id"])
+                response = RedirectResponse(url="/index", status_code=303)
+                response.set_cookie(key="current_user", value=user_db_id)
+                return response
+            else:
+                return templates.TemplateResponse("login.html", {"request": request, "error": "بيانات الدخول غير صحيحة."})
+    except Exception:
+        traceback.print_exc()
+        return templates.TemplateResponse("login.html", {"request": request, "error": "حدث خطأ أثناء محاولة تسجيل الدخول."})
+
+
+# ---------- صفحة التقاط الاشعار (index) ----------
+@app.get("/index")
+def index(request: Request):
+    user_id = request.cookies.get("current_user")
+    if not user_id:
+        return RedirectResponse("/login", status_code=303)
+    # تمرير التاريخ الحالي كي يتم عرضه إذا رغبت
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return templates.TemplateResponse("index.html", {"request": request, "data": {"date_time": current_time}})
+
+
+# ---------- حفظ صورة ملتقطة من الكاميرا (capture) - يتم استدعاؤها بالـ fetch من الـ frontend ----------
+@app.post("/capture_image")
+async def capture_image(request: Request):
+    """
+    يتوقع JSON { "image_data": "data:image/png;base64,...." }
+    يقوم بحفظ الصورة، تطبيق معالجة، تشغيل OCR لاستخراج المبلغ، ثم حفظ السجل في DB.
+    """
+    try:
+        payload = await request.json()
+        image_data = payload.get("image_data")
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON"}, status_code=400)
+
+    user_id = request.cookies.get("current_user")
+    if not user_id:
+        return JSONResponse({"success": False, "error": "Not logged in"}, status_code=401)
+
+    try:
+        user_id_int = int(user_id)
+    except ValueError:
+        return JSONResponse({"success": False, "error": "Invalid user id"}, status_code=400)
+
+    if not image_data:
+        return JSONResponse({"success": False, "error": "No image_data provided"}, status_code=400)
+
+    # تفكيك البادئة base64
+    if "," in image_data:
+        header, b64 = image_data.split(",", 1)
+    else:
+        b64 = image_data
+
+    try:
+        img_bytes = base64.b64decode(b64)
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid base64 image"}, status_code=400)
+
+    # حفظ الملف باسم فريد
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    filename = f"{user_id_int}_{timestamp}.png"
+    filepath = os.path.join(RECEIPTS_DIR, filename)
+
+    try:
+        with open(filepath, "wb") as f:
+            f.write(img_bytes)
+    except Exception:
+        traceback.print_exc()
+        return JSONResponse({"success": False, "error": "Failed saving file"}, status_code=500)
+
+    # قراءة الصورة من البايت وتشغيل المعالجة ثم OCR
+    try:
+        img = Image.open(filepath)
+        processed = preprocess_for_ocr(img)
+        # استخدم tesseract لاستخراج النص (دعم العربية + إنجليزي إن أمكن)
+        try:
+            txt = pytesseract.image_to_string(processed, lang="ara+eng")
+        except Exception:
+            # fallback بدون تحديد لغة
+            txt = pytesseract.image_to_string(processed)
+        amount = extract_amount_from_text(txt)
+    except Exception:
+        traceback.print_exc()
+        amount = 0.0
+
+    # حفظ السجل في قاعدة البيانات (image_path نحفظ المسار داخل static/receipts)
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO transactions (user_id, image_path, amount, created_at) VALUES (?, ?, ?, ?)",
+                (user_id_int, filepath, float(amount), created_at)
+            )
+            conn.commit()
+    except Exception:
+        traceback.print_exc()
+        # رغم الخطأ في الحفظ في DB الصورة محفوظة على الأقل؛ نبلغ العميل بفشل DB
+        return JSONResponse({"success": False, "error": "Saved image but failed to record transaction"}, status_code=500)
+
+    return JSONResponse({"success": True, "amount": float(amount), "filename": filename})
+
+
+# ---------- رفع ملف صورة (بديل لمسح الكاميرا) - endpoint /scan ----------
 @app.post("/scan")
-async def scan_receipt(request: Request, file: UploadFile = File(...)):
-    temp_filename = f"temp_{file.filename}"
-    with open(temp_filename, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    extracted_data, raw_text = extract_data_from_image(temp_filename)
-    
-    if os.path.exists(temp_filename):
-        os.remove(temp_filename)
-    
-    return templates.TemplateResponse("review.html", {
-        "request": request,
-        "data": extracted_data,
-        "raw_text": raw_text
-    })
+async def scan_receipt(file: UploadFile = File(...)):
+    # يحفظ الملف مؤقتًا ثم يستدعي نفس المنطق لاستخراج المبلغ
+    try:
+        contents = await file.read()
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"upload_{timestamp}_{file.filename}"
+        filepath = os.path.join(RECEIPTS_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(contents)
 
-@app.post("/confirm")
-def confirm_data(
-    request: Request,
-    trx_last4: str = Form(...),
-    date_time: str = Form(...),
-    amount: float = Form(...),
-):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO transactions (trx_last4, trx_date, amount) VALUES (?, ?, ?)",
-            (trx_last4, date_time, amount)
-        )
-        conn.commit()
-    
-    return RedirectResponse(url="/transactions", status_code=303)
+        img = Image.open(filepath)
+        processed = preprocess_for_ocr(img)
+        try:
+            txt = pytesseract.image_to_string(processed, lang="ara+eng")
+        except Exception:
+            txt = pytesseract.image_to_string(processed)
+        amount = extract_amount_from_text(txt)
 
-@app.get("/transactions")
-def view_transactions(request: Request):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row 
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM transactions ORDER BY id DESC")
-        transactions = cursor.fetchall()
-        
-    # جلب الإجمالي وإرساله إلى القالب
-    total_amount = calculate_total_amount()
-        
+        # هنا لا نربط بالمستخدم — إذا أردت الربط بالمستخدم ضع cookie current_user أو مرره
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO transactions (user_id, image_path, amount, created_at) VALUES (?, ?, ?, ?)",
+                      (None, filepath, float(amount), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+
+        return {"success": True, "amount": float(amount), "filename": filename}
+    except Exception:
+        traceback.print_exc()
+        return {"success": False, "error": "Failed to process upload"}
+
+
+# ---------- صفحة العرض view (صور الإيصالات + إجمالي المبالغ وعدد الصور) ----------
+@app.get("/view")
+def view_receipts(request: Request):
+    user_id = request.cookies.get("current_user")
+    if not user_id:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        user_id_int = int(user_id)
+    except ValueError:
+        return RedirectResponse("/login", status_code=303)
+
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC", (user_id_int,))
+            rows = c.fetchall()
+    except Exception:
+        traceback.print_exc()
+        rows = []
+
+    images = [os.path.basename(r["image_path"]) for r in rows if r["image_path"]]
+    total_images = len(images)
+    total_amount = sum([float(r["amount"] or 0) for r in rows]) if rows else 0.0
+
     return templates.TemplateResponse("view.html", {
-        "request": request, 
-        "transactions": transactions,
-        "total_amount": total_amount # تمرير الإجمالي هنا
+        "request": request,
+        "images": images,
+        "total_images": total_images,
+        "total_amount": "%.2f" % total_amount
     })
 
+
+# ---------- حذف إشعار واحد ----------
 @app.post("/delete/{id}")
-def delete_transaction(id: int):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM transactions WHERE id = ?", (id,))
-        conn.commit()
-        
-    return RedirectResponse(url="/transactions", status_code=303)
+def delete_transaction(id: int, request: Request):
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute("SELECT image_path FROM transactions WHERE id = ?", (id,))
+            row = c.fetchone()
+            if row and row[0] and os.path.exists(row[0]):
+                os.remove(row[0])
+            c.execute("DELETE FROM transactions WHERE id = ?", (id,))
+            conn.commit()
+    except Exception:
+        traceback.print_exc()
+    return RedirectResponse("/view", status_code=303)
+
+
+# ---------- حذف كل الإشعارات للمستخدم ----------
+@app.post("/delete_all")
+def delete_all(request: Request):
+    user_id = request.cookies.get("current_user")
+    if not user_id:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        user_id_int = int(user_id)
+    except ValueError:
+        return RedirectResponse("/login", status_code=303)
+
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute("SELECT image_path FROM transactions WHERE user_id = ?", (user_id_int,))
+            rows = c.fetchall()
+            for r in rows:
+                path = r[0]
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+            c.execute("DELETE FROM transactions WHERE user_id = ?", (user_id_int,))
+            conn.commit()
+    except Exception:
+        traceback.print_exc()
+    return RedirectResponse("/view", status_code=303)
+
+
+# ---------- export pdf (اختياري) ----------
+@app.get("/export_pdf")
+def export_pdf(request: Request):
+    # يمكنك تخصيص هذا لاحقًا - هنا مجرد placeholder يعيد Redirect إلى /view
+    return RedirectResponse("/view", status_code=303)
+
+
+# ---------- تشغيل محلي ----------
+if __name__ == "__main__":
+    import uvicorn
+    # إذا كنت على Windows وقد ثبتت Tesseract في مسار افتراضي قم بتعيينه هنا:
+    # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
